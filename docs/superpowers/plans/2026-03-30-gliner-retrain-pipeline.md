@@ -566,6 +566,9 @@ This replaces the GPT pretraining script entirely. It's a self-contained HF Jobs
 """
 GLiNER fine-tuning script for HF Jobs.
 
+Saves checkpoints locally and uploads each one to HF Hub as it's created.
+Final model is also pushed to a dedicated HF repo.
+
 Usage (HF Jobs):
     hf jobs uv run \
         --flavor a100-large \
@@ -595,7 +598,8 @@ from pathlib import Path
 import torch
 from gliner import GLiNER
 from gliner.training import Trainer, TrainingArguments
-from gliner.data_processing.collator import DataCollatorWithPadding
+from huggingface_hub import HfApi
+from transformers import TrainerCallback
 
 # ---------------------------------------------------------------------------
 # Paths: auto-detect HF Jobs mounts vs local
@@ -603,6 +607,12 @@ from gliner.data_processing.collator import DataCollatorWithPadding
 DATA_DIR = "/data" if os.path.isdir("/data") else "./data"
 RESULTS_DIR = "/results" if os.path.isdir("/results") else "./results"
 TRAIN_FILE = os.path.join(DATA_DIR, "train_clean.jsonl")
+
+# ---------------------------------------------------------------------------
+# HF Hub checkpoint upload config
+# ---------------------------------------------------------------------------
+HF_CHECKPOINT_REPO = "arthrod/gliner-pii-mmbert-retrain-checkpoints"
+HF_FINAL_REPO = "arthrod/gliner-pii-mmbert-retrain-best"
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (the agent modifies these)
@@ -624,12 +634,44 @@ SAVE_LIMIT = 8
 SEED = 42
 
 # ---------------------------------------------------------------------------
+# Callback: upload each checkpoint to HF Hub
+# ---------------------------------------------------------------------------
+
+class HFUploadCallback(TrainerCallback):
+    """Uploads each saved checkpoint to HF Hub."""
+
+    def __init__(self, repo_id: str):
+        self.repo_id = repo_id
+        self.api = HfApi()
+        # Create repo if it doesn't exist
+        self.api.create_repo(repo_id, repo_type="model", private=True, exist_ok=True)
+
+    def on_save(self, args, state, control, **kwargs):
+        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if not os.path.isdir(checkpoint_dir):
+            return
+        subfolder = f"checkpoint-{state.global_step}"
+        print(f"Uploading checkpoint {state.global_step} to {self.repo_id}/{subfolder}...")
+        try:
+            self.api.upload_folder(
+                folder_path=checkpoint_dir,
+                repo_id=self.repo_id,
+                repo_type="model",
+                path_in_repo=subfolder,
+                commit_message=f"checkpoint step {state.global_step} (loss={state.log_history[-1].get('loss', '?')})",
+            )
+            print(f"  Uploaded checkpoint-{state.global_step}")
+        except Exception as e:
+            print(f"  WARNING: checkpoint upload failed: {e}")
+
+# ---------------------------------------------------------------------------
 # Setup and train
 # ---------------------------------------------------------------------------
 
 def main():
     t0 = time.time()
     torch.manual_seed(SEED)
+    api = HfApi()
 
     # Load training data
     print(f"Loading training data from {TRAIN_FILE}...")
@@ -673,25 +715,41 @@ def main():
         report_to="wandb",
     )
 
+    upload_callback = HFUploadCallback(repo_id=HF_CHECKPOINT_REPO)
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_data,
+        callbacks=[upload_callback],
     )
 
     print(f"Starting training ({NUM_STEPS} steps)...")
+    print(f"Checkpoints will be uploaded to: {HF_CHECKPOINT_REPO}")
     trainer.train()
 
-    # Save final model
+    # Save and upload final model
     final_path = os.path.join(RESULTS_DIR, "final_model")
     model.save_pretrained(final_path)
     print(f"Saved final model to {final_path}")
+
+    print(f"Uploading final model to {HF_FINAL_REPO}...")
+    api.create_repo(HF_FINAL_REPO, repo_type="model", private=True, exist_ok=True)
+    api.upload_folder(
+        folder_path=final_path,
+        repo_id=HF_FINAL_REPO,
+        repo_type="model",
+        commit_message=f"Final model after {NUM_STEPS} steps",
+    )
+    print(f"Final model uploaded to {HF_FINAL_REPO}")
 
     elapsed = time.time() - t0
     print(f"\n---")
     print(f"training_seconds: {elapsed:.1f}")
     print(f"num_steps: {NUM_STEPS}")
     print(f"train_samples: {len(train_data)}")
+    print(f"checkpoints_repo: {HF_CHECKPOINT_REPO}")
+    print(f"final_model_repo: {HF_FINAL_REPO}")
 
 
 if __name__ == "__main__":
